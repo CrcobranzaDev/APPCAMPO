@@ -20,6 +20,7 @@ import { SincronizacionCampoModule } from './mascara/syncro.module';
 import { ListasModule } from './listas/listas.module';
 import { DashboardGestoresModule } from './dasboard/dashboard-gestores.module';
 import { AsteriskinModule } from './asteriskin/asteriskin.module';
+import { IaCampoModule } from './ia/ia-campo.module';
 
 
 @Module({
@@ -48,6 +49,7 @@ import { AsteriskinModule } from './asteriskin/asteriskin.module';
     ListasModule,
     DashboardGestoresModule,
     AsteriskinModule,
+    IaCampoModule
     
   ],
 })

@@ -5,6 +5,8 @@ import { JwtService } from '@nestjs/jwt';
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import { WebSocket } from 'ws';
 import { ConnectionName } from 'src/database/constants/connection-names';
+import { GPS_CONFIG } from  './gps.config';
+import { GestorMsg, PingLoteDto } from  './gps.dto';
 
 // ══════════════════════════════════════════════════════════
 //  INTERFACES
@@ -15,9 +17,9 @@ interface UbicacionGestor {
   lat: number;
   lng: number;
   precision: number;
-  ultimoEnvio: Date;
+  ultimoEnvio: Date; // hora de CAPTURA del último ping (no de recepción)
   online: boolean;
-  ultimoSync: Date;
+  ultimoSync: Date; // última vez que se guardó en BD (para el throttle)
   ws: WebSocket | null;
   kmRecorridos: number;
   latAnterior: number;
@@ -40,16 +42,14 @@ export class GpsService implements OnModuleInit {
   ) {}
 
   onModuleInit() {
-    // Revisar inactividad cada 30s
-    setInterval(() => this.checkOfflineGestores(), 30_000);
+    setInterval(() => this.checkOfflineGestores(), GPS_CONFIG.CHECK_OFFLINE_MS);
   }
 
   // ══════════════════════════════════════════════════════
   //  REGISTRAR RUTAS (WS y HTTP)
   // ══════════════════════════════════════════════════════
   registerRoutes(fastify: FastifyInstance) {
-    
-    // 1. CANAL WEBSOCKET — Para App en primer plano
+    // 1. CANAL WEBSOCKET — App en primer plano
     fastify.get('/App/campo/gps', { websocket: true }, (socket: WebSocket, req: any) => {
       const token = this.extractToken(req);
       if (!token) return socket.close(1008, 'Sin token');
@@ -60,18 +60,15 @@ export class GpsService implements OnModuleInit {
         const nombre = payload.nombre ?? email.split('@')[0];
 
         this.wsToEmail.set(socket, email);
-        this.inicializarGestorEnMemoria(email, nombre, socket);
+        void this.inicializarGestorEnMemoria(email, nombre, socket);
 
         this.logger.log(`GPS: Gestor conectado vía WS: ${email}`);
-        
-        // Notificar conexión
         this.broadcastSupervisores({ type: 'gestor_online', email, nombre });
         this.send(socket, { type: 'mapa_init', data: this.getMapaActual() });
 
         socket.on('message', async (raw: Buffer) => {
           try {
             const msg = JSON.parse(raw.toString());
-            // CAMBIO: Ahora es público para ser llamado desde las rutas
             await this.handleGestorMessage(socket, email, msg);
           } catch {
             this.logger.warn(`GPS: JSON inválido de ${email}`);
@@ -80,12 +77,12 @@ export class GpsService implements OnModuleInit {
 
         socket.on('close', () => this.handleGestorClose(socket, email));
         socket.on('error', (err) => this.logger.error(`GPS Error ${email}: ${err.message}`));
-      } catch (e) {
+      } catch {
         socket.close(1008, 'Token expirado');
       }
     });
 
-    // 2. CANAL HTTP POST — Para App en segundo plano (Background)
+    // 2. CANAL HTTP POST — App en segundo plano (un ping a la vez)
     fastify.post('/App/campo/gps/sync', async (request: FastifyRequest, reply) => {
       const token = this.extractToken(request);
       if (!token) return reply.code(401).send({ error: 'No token' });
@@ -95,22 +92,19 @@ export class GpsService implements OnModuleInit {
         const email = payload.email;
         const msg = request.body as any;
 
-        // Si el gestor no está en memoria (ej. reinició servidor), lo creamos
         if (!this.gestores.has(email)) {
           const nombre = payload.nombre ?? email.split('@')[0];
-          this.inicializarGestorEnMemoria(email, nombre, null);
+          await this.inicializarGestorEnMemoria(email, nombre, null);
         }
 
-        // Procesamos la ubicación exactamente igual que el WS
         await this.handleGestorMessage(null, email, msg);
-
         return { status: 'ok', received: true };
-      } catch (err) {
+      } catch {
         return reply.code(401).send({ error: 'Sesión inválida' });
       }
     });
 
-    // 3. CANAL MAPA — Para Supervisores
+    // 3. CANAL MAPA — Supervisores
     fastify.get('/App/campo/mapa', { websocket: true }, (socket: WebSocket) => {
       this.supervisores.add(socket);
       this.send(socket, { type: 'mapa_init', data: this.getMapaActual() });
@@ -120,99 +114,164 @@ export class GpsService implements OnModuleInit {
 
   // ══════════════════════════════════════════════════════
   //  PROCESAMIENTO DE MENSAJES (Lógica Central)
-  //  CAMBIO: Se pone PUBLIC para que registerRoutes pueda acceder
+  //  Soporta WebSocket (ws) y HTTP (null)
   // ══════════════════════════════════════════════════════
-  // ══════════════════════════════════════════════════════════
-//  PROCESAMIENTO DE MENSAJES (Lógica Central)
-//  Soporta tanto WebSocket (ws) como peticiones HTTP (null)
-// ══════════════════════════════════════════════════════════
-public async handleGestorMessage(ws: WebSocket | null, email: string, msg: any) {
-  // 1. Validar que el mensaje tenga datos mínimos
-  if (!msg || !msg.type) return;
+  public async handleGestorMessage(ws: WebSocket | null, email: string, msg: GestorMsg) {
+    if (!msg || !msg.type) return;
 
-  // 2. Obtener o inicializar el gestor en memoria
-  let gestor = this.gestores.get(email);
-  if (!gestor) {
-    const nombre = email.split('@')[0];
-    this.inicializarGestorEnMemoria(email, nombre, ws);
-    gestor = this.gestores.get(email)!;
-  }
+    let gestor = this.gestores.get(email);
+    if (!gestor) {
+      const nombre = email.split('@')[0];
+      await this.inicializarGestorEnMemoria(email, nombre, ws);
+      gestor = this.gestores.get(email)!;
+    }
 
-  // 3. Procesar según el tipo de mensaje
-  switch (msg.type) {
-    case 'ubicacion':
-      // --- CÁLCULO DE DISTANCIA (ODÓMETRO) ---
-      // Solo calculamos si ya tenemos una coordenada previa válida
-      if (gestor.lat !== 0 && gestor.lng !== 0 && msg.lat !== 0 && msg.lng !== 0) {
-        const dist = this.calcularDistanciaKm(gestor.lat, gestor.lng, msg.lat, msg.lng);
-        
-        // Filtro de ruido: 
-        // > 0.005 (5 metros) para ignorar GPS "saltarín" estando quieto.
-        // < 1.5 (1.5km) para ignorar saltos falsos por cambio de torre celular.
-        if (dist > 0.005 && dist < 1.5) {
-          gestor.kmRecorridos += dist;
+    switch (msg.type) {
+      case 'ubicacion': {
+        const m = msg as any;
+        if (m.lat == null || m.lng == null) return;
+
+        // ── FECHA DE CAPTURA (no de recepción) ──────────────────
+        // El teléfono manda su timestamp; si no viene o el reloj está
+        // roto (>12h de desfase), caemos a la hora del servidor.
+        const fechaCaptura = m.timestamp ? new Date(m.timestamp) : new Date();
+        const desfaseMin = Math.abs(Date.now() - fechaCaptura.getTime()) / 60000;
+        const fechaFinal =
+          desfaseMin > GPS_CONFIG.DESFASE_MAX_MIN ? new Date() : fechaCaptura;
+
+        // ── ODÓMETRO ────────────────────────────────────────────
+        if (gestor.lat !== 0 && gestor.lng !== 0 && m.lat !== 0 && m.lng !== 0) {
+          const dist = this.calcularDistanciaKm(gestor.lat, gestor.lng, m.lat, m.lng);
+          if (dist > GPS_CONFIG.ODOMETRO_MIN_KM && dist < GPS_CONFIG.ODOMETRO_MAX_KM) {
+            gestor.kmRecorridos += dist;
+          }
         }
+
+        // ── ACTUALIZAR ESTADO EN MEMORIA ────────────────────────
+        gestor.latAnterior = gestor.lat;
+        gestor.lngAnterior = gestor.lng;
+        gestor.lat = m.lat;
+        gestor.lng = m.lng;
+        gestor.precision = m.precision ?? 0;
+        gestor.ultimoEnvio = fechaFinal;
+        gestor.online = true;
+        if (ws) gestor.ws = ws;
+
+        // ── SYNC A BD (throttle) ────────────────────────────────
+        const tiempoDesdeUltimoSync =
+          (Date.now() - gestor.ultimoSync.getTime()) / 1000;
+        if (tiempoDesdeUltimoSync >= GPS_CONFIG.SYNC_INTERVAL_SEG) {
+          this.upsertUbicacionEnBD(gestor).catch((err) =>
+            this.logger.error(`Error Sync BD ${email}: ${err.message}`),
+          );
+          gestor.ultimoSync = new Date();
+        }
+
+        this.broadcastSupervisores({ type: 'mapa_update', data: this.getMapaActual() });
+        break;
       }
 
-      // --- ACTUALIZAR ESTADO EN MEMORIA ---
-      gestor.latAnterior = gestor.lat;
-      gestor.lngAnterior = gestor.lng;
-      gestor.lat = msg.lat;
-      gestor.lng = msg.lng;
-      gestor.precision = msg.precision ?? 0;
-      gestor.ultimoEnvio = new Date();
-      gestor.online = true;
-      
-      // Si entra por WS, actualizamos la referencia del socket
-      if (ws) gestor.ws = ws; 
-
-      // --- SINCRONIZACIÓN A BASE DE DATOS SQL SERVER ---
-      // Para no saturar el DS, guardamos en BD solo cada 30 segundos
-      const ahora = Date.now();
-      const tiempoDesdeUltimoSync = (ahora - gestor.ultimoSync.getTime()) / 1000;
-
-      if (tiempoDesdeUltimoSync >= 30) {
-        // Ejecuta el SP de actualización en segundo plano
-        this.upsertUbicacionEnBD(gestor).catch(err => 
-          this.logger.error(`Error en Sync BD para ${email}: ${err.message}`)
-        );
-        gestor.ultimoSync = new Date();
+      case 'ping': {
+        gestor.ultimoEnvio = new Date();
+        gestor.online = true;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          this.send(ws, {
+            type: 'pong',
+            time: new Date().toISOString(),
+            serverTime: Date.now(),
+          });
+        }
+        break;
       }
 
-      // --- NOTIFICAR A SUPERVISORES ---
-      // Enviamos el mapa actualizado a todos los que tengan abierto el panel de monitoreo
-      this.broadcastSupervisores({ 
-        type: 'mapa_update', 
-        data: this.getMapaActual() 
-      });
-      break;
-
-    case 'ping':
-      // El "ping" mantiene la conexión viva y resetea el tiempo de inactividad
-      gestor.ultimoEnvio = new Date();
-      gestor.online = true;
-      
-      // Si hay un socket abierto (WS), respondemos el PONG
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        this.send(ws, { 
-          type: 'pong', 
-          time: new Date().toISOString(),
-          serverTime: Date.now() 
-        });
-      }
-      break;
-
-    default:
-      this.logger.debug(`Tipo de mensaje no manejado: ${msg.type} de ${email}`);
-      break;
+      default:
+        this.logger.debug(`Tipo no manejado: ${msg.type} de ${email}`);
+    }
   }
-}
+
+  // ══════════════════════════════════════════════════════
+  //  LOTE OFFLINE — inserta pings buffereados DIRECTO al log
+  //  Llamado desde el controller (POST /gpes/sync-lote)
+  //
+  //  NO pasa por gestor_ubicacion, NO dispara el trigger,
+  //  NO pasa por el throttle de 30s. Cada ping conserva su
+  //  timestamp ORIGINAL de captura.
+  // ══════════════════════════════════════════════════════
+  public async insertarLoteLog(email: string, pings: PingLoteDto[]): Promise<number> {
+    const validos = pings.filter(
+      (p) => p.lat !== 0 && p.lng !== 0 && p.timestamp > 0,
+    );
+    if (!validos.length) return 0;
+
+    // Ordenar por timestamp para que el log quede cronológico
+    validos.sort((a, b) => a.timestamp - b.timestamp);
+
+    // SQL Server limita a 2100 parámetros; con 5 por ping = ~420 pings/insert.
+    // Insertamos en bloques de 400 por seguridad.
+    const BLOQUE = 400;
+    let insertados = 0;
+
+    for (let inicio = 0; inicio < validos.length; inicio += BLOQUE) {
+      const chunk = validos.slice(inicio, inicio + BLOQUE);
+
+      const filas = chunk
+        .map(
+          (_, i) =>
+            `(@${i * 5}, @${i * 5 + 1}, @${i * 5 + 2}, @${i * 5 + 3}, @${i * 5 + 4}, 0, 'SYNC')`,
+        )
+        .join(', ');
+
+      const params = chunk.flatMap((p) => [
+        email,
+        p.lat,
+        p.lng,
+        p.precision ?? 0,
+        new Date(p.timestamp),
+      ]);
+
+      await this.dsCampo.query(
+        `INSERT INTO gestor_ubicacion_log
+           (email, lat, lng, [precision], fecha_envio, online, origen)
+         VALUES ${filas}`,
+        params,
+      );
+      insertados += chunk.length;
+    }
+
+    // Actualizar posición actual con el ÚLTIMO ping del lote
+    const ultimo = validos[validos.length - 1];
+    await this.handleGestorMessage(null, email, {
+      type: 'ubicacion',
+      lat: ultimo.lat,
+      lng: ultimo.lng,
+      precision: ultimo.precision,
+      timestamp: ultimo.timestamp,
+    });
+
+    // Avisar a Python que recalcule (cuando esté habilitado)
+    await this.invalidarCachePython(email);
+
+    this.logger.log(`GPS: Lote SYNC de ${email}: ${insertados} pings`);
+    return insertados;
+  }
+
   // ══════════════════════════════════════════════════════
   //  HELPERS INTERNOS
   // ══════════════════════════════════════════════════════
 
-  private inicializarGestorEnMemoria(email: string, nombre: string, socket: WebSocket | null) {
+  private async inicializarGestorEnMemoria(
+    email: string,
+    nombre: string,
+    socket: WebSocket | null,
+  ) {
     const existing = this.gestores.get(email);
+
+    // Recuperar km del día desde el log si es primera vez (tras reinicio)
+    let kmHoy = existing?.kmRecorridos ?? 0;
+    if (!existing) {
+      kmHoy = await this.recuperarKmDelDia(email);
+    }
+
     this.gestores.set(email, {
       email,
       nombre,
@@ -222,17 +281,38 @@ public async handleGestorMessage(ws: WebSocket | null, email: string, msg: any) 
       ultimoEnvio: new Date(),
       online: true,
       ultimoSync: existing?.ultimoSync ?? new Date(0),
-      ws: socket, // Si entra por HTTP, socket es null
-      kmRecorridos: existing?.kmRecorridos ?? 0,
+      ws: socket,
+      kmRecorridos: kmHoy,
       latAnterior: existing?.lat ?? 0,
       lngAnterior: existing?.lng ?? 0,
     });
   }
 
+  /** Reconstruye el odómetro del día leyendo el log (sobrevive reinicios). */
+  private async recuperarKmDelDia(email: string): Promise<number> {
+    try {
+      const r: Array<{ lat: number; lng: number }> = await this.dsCampo.query(
+        `SELECT lat, lng
+           FROM gestor_ubicacion_log
+          WHERE email = @0
+            AND CAST(fecha_envio AS DATE) = CAST(GETDATE() AS DATE)
+          ORDER BY fecha_envio ASC`,
+        [email],
+      );
+      let km = 0;
+      for (let i = 1; i < r.length; i++) {
+        const d = this.calcularDistanciaKm(r[i - 1].lat, r[i - 1].lng, r[i].lat, r[i].lng);
+        if (d > GPS_CONFIG.ODOMETRO_MIN_KM && d < GPS_CONFIG.ODOMETRO_MAX_KM) km += d;
+      }
+      return km;
+    } catch {
+      return 0;
+    }
+  }
+
   private extractToken(req: any): string | null {
     const auth = req.headers?.authorization;
     if (auth?.startsWith('Bearer ')) return auth.replace('Bearer ', '');
-    // Soporte para token por query params (común en WebSockets)
     const url = new URL(req.url, 'http://localhost');
     return url.searchParams.get('token') || (req.query as any)?.token || null;
   }
@@ -241,9 +321,7 @@ public async handleGestorMessage(ws: WebSocket | null, email: string, msg: any) 
     const ahora = Date.now();
     this.gestores.forEach((g, email) => {
       if (!g.online) return;
-      
-      // Margen de 130 segundos (un poco más de los 2 min por latencia)
-      if ((ahora - g.ultimoEnvio.getTime()) > 130_000) {
+      if (ahora - g.ultimoEnvio.getTime() > GPS_CONFIG.OFFLINE_TIMEOUT_MS) {
         g.online = false;
         this.marcarOfflineEnBD(email).catch(() => {});
         this.broadcastSupervisores({ type: 'gestor_offline', email });
@@ -255,11 +333,15 @@ public async handleGestorMessage(ws: WebSocket | null, email: string, msg: any) 
 
   private async upsertUbicacionEnBD(g: UbicacionGestor) {
     try {
-      // Usar parámetros nombrados o posicionales según tu configuración de TypeORM
-      await this.dsCampo.query(
-        `EXEC SP_UpsertUbicacion @0, @1, @2, @3, @4`, 
-        [g.email, g.nombre, g.lat, g.lng, g.precision]
-      );
+      // El SP recibe la fecha de CAPTURA como parámetro (no usa GETDATE())
+      await this.dsCampo.query(`EXEC SP_UpsertUbicacion @0, @1, @2, @3, @4, @5`, [
+        g.email,
+        g.nombre,
+        g.lat,
+        g.lng,
+        g.precision,
+        g.ultimoEnvio,
+      ]);
     } catch (e) {
       this.logger.error(`Error SQL Server (Upsert): ${e.message}`);
     }
@@ -267,21 +349,31 @@ public async handleGestorMessage(ws: WebSocket | null, email: string, msg: any) 
 
   private async marcarOfflineEnBD(email: string) {
     try {
-      await this.dsCampo.query(
-        `UPDATE gestor_ubicacion SET online = 0 WHERE email = @0`, 
-        [email]
-      );
-    } catch (e) { /* silent fail */ }
+      await this.dsCampo.query(`UPDATE gestor_ubicacion SET online = 0 WHERE email = @0`, [
+        email,
+      ]);
+    } catch {
+      /* silent fail */
+    }
+  }
+
+  /** Avisa a Python que invalide el caché tras un lote offline. */
+  private async invalidarCachePython(email: string) {
+    if (!GPS_CONFIG.PYTHON_ENABLED) return; // desactivado hasta levantar Python
+    try {
+      await fetch(`${GPS_CONFIG.PYTHON_URL}/invalidar-cache/${email}`, {
+        method: 'POST',
+      });
+    } catch {
+      // Python caído NO debe romper el sync de GPS
+      this.logger.warn(`No se pudo invalidar caché Python para ${email}`);
+    }
   }
 
   private handleGestorClose(socket: WebSocket, email: string) {
     this.wsToEmail.delete(socket);
     const g = this.gestores.get(email);
-    if (g) {
-      g.ws = null; 
-      // IMPORTANTE: No lo marcamos online = false aquí. 
-      // Dejamos que checkOfflineGestores decida si entra o no por HTTP.
-    }
+    if (g) g.ws = null;
     this.logger.log(`GPS: Socket cerrado para ${email}`);
   }
 
@@ -291,13 +383,13 @@ public async handleGestorMessage(ws: WebSocket | null, email: string, msg: any) 
 
   private broadcastSupervisores(data: any) {
     const payload = JSON.stringify(data);
-    this.supervisores.forEach(ws => {
+    this.supervisores.forEach((ws) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(payload);
     });
   }
 
   private getMapaActual(): any[] {
-    return Array.from(this.gestores.values()).map(g => ({
+    return Array.from(this.gestores.values()).map((g) => ({
       email: g.email,
       nombre: g.nombre,
       lat: g.lat,
@@ -310,13 +402,15 @@ public async handleGestorMessage(ws: WebSocket | null, email: string, msg: any) 
   }
 
   private calcularDistanciaKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
-    const R = 6371; // Radio de la tierra en km
+    const R = 6371;
     const dLat = (lat2 - lat1) * (Math.PI / 180);
     const dLng = (lng2 - lng1) * (Math.PI / 180);
-    const a = 
+    const a =
       Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
-      Math.sin(dLng / 2) * Math.sin(dLng / 2);
+      Math.cos(lat1 * (Math.PI / 180)) *
+        Math.cos(lat2 * (Math.PI / 180)) *
+        Math.sin(dLng / 2) *
+        Math.sin(dLng / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
   }

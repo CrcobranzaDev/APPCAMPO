@@ -38,8 +38,25 @@ export class RegistroGestionService {
   ) {}
 
   // ══════════════════════════════════════════════════════
-  //  REGISTRAR GESTIONES
+  //  FECHA/HORA ACTUAL EN ZONA PERÚ (GMT-5, sin DST)
   // ══════════════════════════════════════════════════════
+  private obtenerFechaHoraPeru(): string {
+    const ahoraUTC = new Date();
+
+    // Perú siempre es UTC-5 (no tiene horario de verano)
+    const OFFSET_PERU_MS = -5 * 60 * 60 * 1000;
+    const limaTime = new Date(ahoraUTC.getTime() + OFFSET_PERU_MS);
+
+    const yyyy = limaTime.getUTCFullYear();
+    const mm   = String(limaTime.getUTCMonth() + 1).padStart(2, '0');
+    const dd   = String(limaTime.getUTCDate()).padStart(2, '0');
+    const hh   = String(limaTime.getUTCHours()).padStart(2, '0');
+    const mi   = String(limaTime.getUTCMinutes()).padStart(2, '0');
+    const ss   = String(limaTime.getUTCSeconds()).padStart(2, '0');
+
+    // Formato compatible con datetime de SQL Server
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+  }
 // ══════════════════════════════════════════════════════
 //  REGISTRAR GESTIONES
 // ══════════════════════════════════════════════════════
@@ -90,10 +107,8 @@ async registrarGestiones(
     g.encargado_pago      ?? encargadoComun,
     g.monto_pdp           ?? null,
     g.fecha_pdp           ?? null,
-    // ✅ fecha_gest: usa la del frontend o genera datetime actual
-    g.fecha_gest
-      ? new Date(g.fecha_gest).toISOString().slice(0, 19).replace('T', ' ')
-      : new Date().toISOString().slice(0, 19).replace('T', ' '),
+    //  fecha_gest: usa la del frontend o genera datetime actual
+    g.fecha_gest      ?? this.obtenerFechaHoraPeru(),
   ],
 );
 

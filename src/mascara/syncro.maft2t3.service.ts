@@ -46,25 +46,41 @@ export class SincronizacionCampoServiceMAFT2T3 {
         throw new BadRequestException(`No se encontró mapeo de columnas para la campaña: ${campaignId}`);
       }
 
-      // origenUpper → columna_fisica
+      // origenNormalizado → columna_fisica
       const origenToFisica = new Map<string, string>();
       const keyFisicas     = new Set<string>();
 
       campoMeta.forEach((cm: any) => {
-        const origen = cm.columna_origen.trim().toUpperCase();
+        const origen = this.normalizarHeader(cm.columna_origen);
         const fisica = cm.columna_fisica.trim();
         origenToFisica.set(origen, fisica);
-        if (cm.es_llave) keyFisicas.add(fisica);
+        if (this.esLlave(cm.es_llave)) keyFisicas.add(fisica);
       });
+
+      this.logger.debug(
+        `${campaignId} — columnas llave detectadas (es_llave=1): ${[...keyFisicas].join(', ')}`,
+      );
 
       // 3. Cabeceras del Excel → columna_fisica
       const excelHeaders   = Object.keys(rows[0]);
       const headerToFisica = new Map<string, string>();
+      const sinMatch: string[] = [];
 
       excelHeaders.forEach(h => {
-        const fisica = origenToFisica.get(h.trim().toUpperCase());
-        if (fisica) headerToFisica.set(h, fisica);
+        const normalizado = this.normalizarHeader(h);
+        const fisica = origenToFisica.get(normalizado);
+        if (fisica) {
+          headerToFisica.set(h, fisica);
+        } else {
+          sinMatch.push(h);
+        }
       });
+
+      if (sinMatch.length) {
+        this.logger.debug(
+          `${campaignId} — headers del Excel sin match en columna_origen: ${sinMatch.join(', ')}`,
+        );
+      }
 
       // Validar que todas las llaves físicas estén presentes
       const llavesFisicas = [...keyFisicas];
@@ -72,6 +88,16 @@ export class SincronizacionCampoServiceMAFT2T3 {
       const faltantes     = llavesFisicas.filter(l => !headerFisicas.has(l));
 
       if (faltantes.length) {
+        const detalle = campoMeta
+          .filter((cm: any) => faltantes.includes(cm.columna_fisica.trim()))
+          .map((cm: any) => `${cm.columna_fisica} (origen esperado: "${cm.columna_origen}")`)
+          .join(' | ');
+
+        this.logger.error(
+          `${campaignId} — Llaves faltantes. Detalle: ${detalle}. ` +
+          `Headers recibidos del Excel: ${excelHeaders.join(', ')}`,
+        );
+
         throw new BadRequestException(
           `Faltan columnas llave en el Excel para ${campaignId}: ${faltantes.join(', ')}`
         );
@@ -92,14 +118,10 @@ export class SincronizacionCampoServiceMAFT2T3 {
       const CHUNK = 500;
       let upd     = 0;
 
-      // Obtener las llaves físicas dinámicamente desde keyFisicas
-      const [keyFisica1, keyFisica2, keyFisica3, keyFisica4, keyFisica5] = llavesFisicas;
-
       for (let i = 0; i < rows.length; i += CHUNK) {
         const chunk         = rows.slice(i, i + CHUNK);
         const params: any[] = [campaignIntId];
 
-        // Construir condición OR dinámicamente según las llaves
         const orCond = chunk.map(row => {
           const conditions: string[] = [];
 
@@ -113,7 +135,6 @@ export class SincronizacionCampoServiceMAFT2T3 {
           return `(${conditions.join(' AND ')})`;
         }).join(' OR ');
 
-        // Columnas a seleccionar en la consulta de existentes
         const selectLlaves = llavesFisicas.map(f => `[${f}]`).join(', ');
 
         const existentes: any[] = await this.campoDs.query(
@@ -123,7 +144,6 @@ export class SincronizacionCampoServiceMAFT2T3 {
           params,
         );
 
-        // Construir mapa de existentes con clave dinámica
         const existMap = new Map(
           existentes.map(r => [
             llavesFisicas.map(f => r[f] ?? '').join('|'),
@@ -132,7 +152,6 @@ export class SincronizacionCampoServiceMAFT2T3 {
         );
 
         for (const row of chunk) {
-          // Clave dinámica del row actual
           const key = llavesFisicas
             .map(fisica => row[this.getExcelHeader(headerToFisica, fisica)] ?? '')
             .join('|');
@@ -183,5 +202,39 @@ export class SincronizacionCampoServiceMAFT2T3 {
       if (fis === fisica) return header;
     }
     return '';
+  }
+
+  /**
+   * Interpreta el campo es_llave de campaign_columns_meta sin importar
+   * cómo lo devuelva el driver de SQL Server: bit -> boolean, pero a
+   * veces llega como number (1/0) o como string ("1"/"0", "S"/"N", "Y"/"N").
+   * OJO: en JS el string "0" es truthy, por eso NO se puede usar
+   * simplemente `if (valor)` — hay que parsear explícitamente.
+   */
+  private esLlave(valor: any): boolean {
+    if (valor === true || valor === 1) return true;
+    if (valor === false || valor === 0 || valor === null || valor === undefined) return false;
+
+    const v = String(valor).trim().toUpperCase();
+    return v === '1' || v === 'S' || v === 'SI' || v === 'Y' || v === 'YES' || v === 'TRUE';
+  }
+
+  /**
+   * Normaliza un header para comparación robusta entre Excel y BD:
+   * - trim de espacios normales Y no separables (\u00A0)
+   * - colapsa espacios internos múltiples
+   * - quita tildes/diacríticos (Á -> A)
+   * - uppercase
+   */
+  private normalizarHeader(valor: any): string {
+    if (valor === null || valor === undefined) return '';
+
+    return String(valor)
+      .normalize('NFD')                  // separa letra + tilde
+      .replace(/[\u0300-\u036f]/g, '')   // elimina diacríticos (tildes)
+      .replace(/[\u00A0]/g, ' ')         // NBSP -> espacio normal
+      .replace(/\s+/g, ' ')              // colapsa espacios múltiples
+      .trim()
+      .toUpperCase();
   }
 }

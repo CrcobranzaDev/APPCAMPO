@@ -1,31 +1,58 @@
-import { Controller, Post, Body, UseGuards, Req, UnauthorizedException } from '@nestjs/common';
-import { GpsService } from 'src/websocket/gps.gateway'; // Asegúrate que la ruta sea la correcta
+import {
+  Controller,
+  Post,
+  Body,
+  UseGuards,
+  Req,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { GpsService } from 'src/websocket/gps.gateway';
 import { JwtAuthGuard } from 'src/auth/jwt-auth.guard';
+import type { SyncLoteDto } from './gps.dto';
 
 @Controller('gpes')
 export class GpsController {
   constructor(private readonly gpsService: GpsService) {}
 
+  // ── Ping individual (App en segundo plano, con señal) ──────────────
   @UseGuards(JwtAuthGuard)
   @Post('sync')
   async syncLocation(@Body() data: any, @Req() req: any) {
-    // 1. Validar que el usuario exista en el request (inyectado por JwtAuthGuard)
-    if (!req.user || !req.user.email) {
+    if (!req.user?.email) {
       throw new UnauthorizedException('Usuario no identificado en el token');
     }
+    const email = req.user.email;
 
-    const userEmail = req.user.email;
+    // HTTP → pasamos null como socket
+    await this.gpsService.handleGestorMessage(null, email, data);
 
-    // 2. LLAMADA CORRECTA AL SERVICIO:
-    // Pasamos 'null' porque esta petición viene por HTTP, no por WebSocket.
-    // Usamos 'await' porque el procesamiento incluye cálculos y guardado en BD.
-    await this.gpsService.handleGestorMessage(null, userEmail, data);
-
-    // 3. Respuesta para el servicio nativo de Android
     return {
       status: 'success',
       message: 'Ubicación sincronizada',
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // ── Lote offline (App recupera señal y sube pings buffereados) ─────
+  @UseGuards(JwtAuthGuard)
+  @Post('sync-lote')
+  async syncLote(@Body() body: SyncLoteDto, @Req() req: any) {
+    if (!req.user?.email) {
+      throw new UnauthorizedException('Usuario no identificado en el token');
+    }
+    const email = req.user.email;
+
+    if (!body?.pings?.length) {
+      return { status: 'ok', received: 0 };
+    }
+
+    const insertados = await this.gpsService.insertarLoteLog(email, body.pings);
+
+    return {
+      status: 'success',
+      message: 'Lote sincronizado',
+      received: insertados,
+      timestamp: new Date().toISOString(),
     };
   }
 }
