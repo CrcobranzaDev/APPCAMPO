@@ -1,11 +1,10 @@
-import { NestFactory }                             from '@nestjs/core';
+import { NestFactory }                            from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import fastifyWebsocket                           from '@fastify/websocket';
-import multipart                                  from '@fastify/multipart'; 
+import multipart                                  from '@fastify/multipart';
 import { AppModule }                              from './app.module';
-import { Logger, ValidationPipe }                from '@nestjs/common';
-import { GpsService }                            from 'src/websocket/gps.gateway';
-import * as http                                 from 'http';
+import { Logger, ValidationPipe }                 from '@nestjs/common';
+import { GpsService }                             from 'src/websocket/gps.gateway';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -19,9 +18,9 @@ async function bootstrap() {
   app.setGlobalPrefix('App/campo');
   app.enableCors({ origin: true, credentials: true });
 
-await app.register(fastifyWebsocket);
+  await app.register(fastifyWebsocket);
   await app.register(multipart, {
-    limits: { fileSize: 10 * 1024 * 1024 }  // 10 MB
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
   });
   await app.init();
 
@@ -29,39 +28,15 @@ await app.register(fastifyWebsocket);
   const fastifyInstance = app.getHttpAdapter().getInstance();
   gpsService.registerRoutes(fastifyInstance);
 
-  const HOST        = '0.0.0.0';
-  const WEB_PORT    = 5005;
-  const MOBILE_PORT = 6000;
+  const HOST = '0.0.0.0';
+  const PORT = 5005;
 
   try {
-    // 1. Servidor principal (Puerto 5005)
-    await app.listen(WEB_PORT, HOST);
-    logger.log(`🌐 WEB LOCAL:       http://192.168.1.26:${WEB_PORT}/App/campo`);
-
-    // 2. Servidor secundario (Puerto 6000)
-    // Usa el mismo servidor interno de Fastify para manejar las requests
-    const secondaryServer = http.createServer((req, res) => {
-      // Pasar la request directamente al servidor de Fastify
-      fastifyInstance.server.emit('request', req, res);
-    });
-
-    // Reenviar upgrades de WebSocket al servidor principal
-    secondaryServer.on('upgrade', (req, socket, head) => {
-      fastifyInstance.server.emit('upgrade', req, socket, head);
-    });
-
-    secondaryServer.listen(MOBILE_PORT, HOST, () => {
-      logger.log(`📱 APP MÓVIL (NAT): http://192.168.1.26:${MOBILE_PORT}/App/campo`);
-    });
-
-    secondaryServer.on('error', (err: any) => {
-      if (err.code === 'EADDRINUSE') {
-        logger.error(`❌ Puerto ${MOBILE_PORT} ocupado.`);
-      }
-    });
-
+    await app.listen(PORT, HOST);
+    logger.log(`🌐 WEB LOCAL:  http://localhost:${PORT}/App/campo`);
+    logger.log(`📱 APP MÓVIL:  http://<IP-de-red>:${PORT}/App/campo`);
   } catch (error) {
-    logger.error('💥 Error fatal al iniciar el servidor', error);
+    logger.error('Error fatal al iniciar el servidor', error);
     process.exit(1);
   }
 }

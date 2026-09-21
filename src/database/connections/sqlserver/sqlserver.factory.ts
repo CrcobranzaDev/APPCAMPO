@@ -15,6 +15,7 @@ export function createSqlServerConnection(
     password:    config.getOrThrow<string>(`${instance}_PASSWORD`),
     database:    config.getOrThrow<string>(`${instance}_DATABASE`),
     entities:    [],
+    autoLoadEntities: true,
     synchronize: false,
     logging:     false,
     options: {

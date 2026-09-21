@@ -15,6 +15,11 @@ import {
 } from 'src/upload/carga.interface';
 import { ConfirmarCargaDto } from 'src/upload/confirmar-carga.dto';
 
+// Nombre de la columna física que representa el documento del cliente
+// en campaign_columns_meta.columna_fisica. Ajustar aquí si en alguna
+// campaña usa un nombre distinto (ej. 'dni', 'nro_documento').
+const DOCUMENTO_FISICA_NAME = 'documento';
+
 @Injectable()
 export class CargaService {
   private readonly logger = new Logger(CargaService.name);
@@ -33,7 +38,7 @@ export class CargaService {
   async previsualizarCarga(
     file: Express.Multer.File,
     campaignId: string,
-  ): Promise<PreviewResult> {
+  ): Promise<PreviewResult & { totalBloqueados: number }> {
 
     const [maskMeta, campoMeta] = await Promise.all([
       this.getColMaskMeta(campaignId),
@@ -70,10 +75,71 @@ export class CargaService {
     });
 
     if (!rawRows.length) {
-      return { totalExcel: 0, totalEncontrados: 0, totalNoEncontrados: 0, columnas, registros: [] };
+      return {
+        totalExcel: 0,
+        totalEncontrados: 0,
+        totalNoEncontrados: 0,
+        totalBloqueados: 0,
+        columnas,
+        registros: [],
+      };
     }
 
-    const filas = rawRows.map(row => this.normalizarFila(row, maskMeta, maps.keyFrCols));
+    const filasTotales = rawRows.map(row => this.normalizarFila(row, maskMeta, maps.keyFrCols));
+
+    // ────────────────────────────────────────────────────────────────────
+    // LISTAS NEGRAS: se valida ANTES de tocar FR_MASCARA. Los documentos
+    // bloqueados se descartan aquí mismo y nunca llegan a la búsqueda de
+    // información — así no se gasta esa consulta (chunks de 200 con OR)
+    // en registros que de todas formas no se van a mostrar.
+    // ────────────────────────────────────────────────────────────────────
+    const documentoFrCol = this.resolveDocumentoFrCol(maps);
+
+    let documentosBloqueados = new Set<string>();
+
+    if (documentoFrCol) {
+      const documentosUnicos = [...new Set(
+        filasTotales
+          .map(f => this.extraerDocumento(f, documentoFrCol, maskMeta))
+          .filter(doc => doc),
+      )];
+
+      documentosBloqueados = await this.getDocumentosBloqueados(documentosUnicos, campaignId);
+    } else {
+      this.logger.warn(
+        `No se encontró columna física "${DOCUMENTO_FISICA_NAME}" para la campaña ${campaignId}; no se aplicará el filtro de listas negras.`,
+      );
+    }
+
+    // Filas que SÍ pasan la validación de Listas Negras — solo estas
+    // avanzan a la búsqueda en FR_MASCARA.
+    const filas = documentoFrCol
+      ? filasTotales.filter(f => {
+          const doc = this.extraerDocumento(f, documentoFrCol, maskMeta);
+          return !doc || !documentosBloqueados.has(doc);
+        })
+      : filasTotales;
+
+    const totalBloqueados = filasTotales.length - filas.length;
+
+    if (totalBloqueados > 0) {
+      this.logger.log(
+        `Preview campaña ${campaignId}: ${totalBloqueados} documento(s) inhibidos por Listas Negras (no pasan a FR_MASCARA).`,
+      );
+    }
+
+    if (!filas.length) {
+      return {
+        totalExcel:         filasTotales.length,
+        totalEncontrados:   0,
+        totalNoEncontrados: 0,
+        totalBloqueados,
+        columnas,
+        registros: [],
+      };
+    }
+
+    // Solo los documentos NO bloqueados llegan a esta búsqueda.
     const encontradosMap = await this.buscarEnFRMascara(filas, campaignId, maps.keyFrCols);
 
     const registros: RegistroPreview[] = filas.map(f => {
@@ -89,9 +155,10 @@ export class CargaService {
     });
 
     return {
-      totalExcel:         registros.length,
+      totalExcel:         filasTotales.length,
       totalEncontrados:   registros.filter(r => r.encontrado).length,
       totalNoEncontrados: registros.filter(r => !r.encontrado).length,
+      totalBloqueados,
       columnas,
       registros,
     };
@@ -100,7 +167,9 @@ export class CargaService {
   // ══════════════════════════════════════════════════════════════════════════
   //  PASO 2 — CONFIRMAR
   // ══════════════════════════════════════════════════════════════════════════
-  async confirmarCarga(dto: ConfirmarCargaDto): Promise<{ cargaId: number; insertados: number; omitidos: number }> {
+  async confirmarCarga(
+    dto: ConfirmarCargaDto,
+  ): Promise<{ cargaId: number; insertados: number; omitidos: number; bloqueados: number }> {
     const { campaignId, nombreArchivo, usuarioCarga, registros } = dto;
 
     if (!registros.length) throw new BadRequestException('Sin registros para confirmar');
@@ -126,6 +195,24 @@ export class CargaService {
     this.logger.debug(`keyFrCols: ${JSON.stringify(maps.keyFrCols)}`);
     this.logger.debug(`frToFisica: ${JSON.stringify([...maps.frToFisica.entries()])}`);
 
+    // ────────────────────────────────────────────────────────────────────
+    // LISTAS NEGRAS: doble verificación al confirmar, por si un documento
+    // fue bloqueado entre el preview y este paso (ventana de tiempo).
+    // ────────────────────────────────────────────────────────────────────
+    const documentoFrCol = this.resolveDocumentoFrCol(maps);
+
+    let documentosBloqueados = new Set<string>();
+
+    if (documentoFrCol) {
+      const documentosUnicos = [...new Set(
+        registros
+          .map(r => this.extraerDocumentoDeRegistroConfirmar(r, documentoFrCol))
+          .filter(doc => doc),
+      )];
+
+      documentosBloqueados = await this.getDocumentosBloqueados(documentosUnicos, campaignId);
+    }
+
     // 3. Crear entrada en cargas
     const cargaRes: { carga_id: number }[] = await this.campoDs.query(
       `INSERT INTO [dbo].[cargas] ([campaign_id],[nombre_archivo],[usuario_carga])
@@ -140,6 +227,7 @@ export class CargaService {
     const CHUNK   = 200;
     let insertados = 0;
     let omitidos   = 0;
+    let bloqueados = 0;
 
     for (let i = 0; i < registros.length; i += CHUNK) {
       const chunk = registros.slice(i, i + CHUNK);
@@ -147,6 +235,16 @@ export class CargaService {
       for (const reg of chunk) {
         if (i === 0 && chunk.indexOf(reg) === 0) {
           this.logger.debug(`Primer reg.keys: ${JSON.stringify(reg.keys)}`);
+        }
+
+        // Bloqueo por Listas Negras: se omite sin insertar.
+        if (documentoFrCol) {
+          const doc = this.extraerDocumentoDeRegistroConfirmar(reg, documentoFrCol);
+          if (doc && documentosBloqueados.has(doc)) {
+            this.logger.warn(`Registro omitido por Listas Negras — documento: ${doc}`);
+            bloqueados++;
+            continue;
+          }
         }
 
         const params = this.buildInsertParams(reg, maps, cargaId, campaignIntId, campaignId);
@@ -186,9 +284,11 @@ export class CargaService {
       }
     }
 
-    this.logger.log(`Carga ${cargaId} finalizada — insertados: ${insertados}, omitidos: ${omitidos}`);
+    this.logger.log(
+      `Carga ${cargaId} finalizada — insertados: ${insertados}, omitidos: ${omitidos}, bloqueados: ${bloqueados}`,
+    );
 
-    return { cargaId, insertados, omitidos };
+    return { cargaId, insertados, omitidos, bloqueados };
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -344,5 +444,124 @@ export class CargaService {
     }
 
     return params;
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  //  LISTAS NEGRAS
+  // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Encuentra el frCol (columna del Excel/FR_MASCARA) que corresponde
+   * a la columna física "documento" según campaign_columns_meta.
+   * Devuelve null si la campaña no tiene esa columna mapeada.
+   */
+  private resolveDocumentoFrCol(maps: CampaniaMaps): string | null {
+    for (const [frCol, fisica] of maps.frToFisica.entries()) {
+      if (fisica.trim().toLowerCase() === DOCUMENTO_FISICA_NAME) {
+        return frCol;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Extrae el valor de documento de una fila normalizada del Excel.
+   * Si la columna de documento es llave (es_llave=1), viene en f.keys;
+   * si no, se busca en excelData usando su etiqueta.
+   */
+  private extraerDocumento(
+    f: FilaExcelNormalizada,
+    documentoFrCol: string,
+    maskMeta: ColMaskMeta[],
+  ): string {
+    if (f.keys[documentoFrCol] !== undefined) {
+      return f.keys[documentoFrCol];
+    }
+
+    const meta = maskMeta.find(m => m.columna.trim() === documentoFrCol);
+    if (meta) {
+      return f.excelData[meta.columna_etiqueta.trim()] ?? '';
+    }
+
+    return '';
+  }
+
+  /**
+   * Extrae el valor de documento de un RegistroConfirmar (paso de
+   * confirmación), intentando primero en keys y luego en datosEncontrados.
+   */
+  private extraerDocumentoDeRegistroConfirmar(
+    reg: RegistroConfirmar,
+    documentoFrCol: string,
+  ): string {
+    if (reg.keys?.[documentoFrCol] !== undefined) {
+      return String(reg.keys[documentoFrCol] ?? '').trim();
+    }
+
+    if (reg.datosEncontrados?.[documentoFrCol] !== undefined) {
+      return String(reg.datosEncontrados[documentoFrCol] ?? '').trim();
+    }
+
+    return '';
+  }
+
+  /**
+   * Consulta list_negras y devuelve el conjunto de documentos
+   * efectivamente bloqueados (act=1) para la campaña dada, aplicando
+   * precedencia: regla específica de campaña > regla general (ALL).
+   */
+  private async getDocumentosBloqueados(
+    documentos: string[],
+    campaignId: string,
+  ): Promise<Set<string>> {
+    if (!documentos.length) return new Set();
+
+    const CHUNK = 500; // límite prudente de parámetros por consulta
+    const bloqueados = new Set<string>();
+
+    for (let i = 0; i < documentos.length; i += CHUNK) {
+      const chunk = documentos.slice(i, i + CHUNK);
+
+      // @0 = campaignId, @1..@N = documentos del chunk
+      const params: any[] = [campaignId, ...chunk];
+      const placeholders = chunk.map((_, idx) => `@${idx + 1}`).join(', ');
+
+      const sql = `
+        SELECT [documento], [campaing_id], [act]
+        FROM [dbo].[list_negras]
+        WHERE [campaing_id] IN (@0, 'ALL')
+          AND [documento] IN (${placeholders})`;
+
+      const rows: { documento: string; campaing_id: string; act: number }[] =
+        await this.campoDs.query(sql, params);
+
+      // Agrupar por documento aplicando precedencia:
+      // específico de campaña > ALL
+      const porDocumento = new Map<string, { especifico?: number; all?: number }>();
+
+      rows.forEach(row => {
+        const doc = String(row.documento ?? '').trim();
+        if (!doc) return;
+
+        const entry = porDocumento.get(doc) ?? {};
+
+        if (String(row.campaing_id).toUpperCase() === 'ALL') {
+          entry.all = Number(row.act);
+        } else {
+          entry.especifico = Number(row.act);
+        }
+
+        porDocumento.set(doc, entry);
+      });
+
+      porDocumento.forEach((regla, doc) => {
+        const actEfectivo = regla.especifico !== undefined ? regla.especifico : regla.all;
+        if (actEfectivo === 1) {
+          bloqueados.add(doc);
+        }
+      });
+    }
+
+    return bloqueados;
   }
 }
