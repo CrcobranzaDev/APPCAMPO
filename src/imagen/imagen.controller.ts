@@ -34,7 +34,12 @@ export class ImagenController {
     @Param('*') ruta: string,
     @Res() reply: FastifyReply,
   ) {
-    const rutaAbsoluta = path.join(UPLOAD_BASE, ruta);
+    const rutaAbsoluta = path.resolve(UPLOAD_BASE, ruta);
+
+    // Evitar path traversal (../)
+    if (!rutaAbsoluta.startsWith(path.resolve(UPLOAD_BASE) + path.sep)) {
+      throw new NotFoundException(`Imagen no encontrada: ${ruta}`);
+    }
 
     // Verificar que el archivo existe
     if (!fs.existsSync(rutaAbsoluta)) {

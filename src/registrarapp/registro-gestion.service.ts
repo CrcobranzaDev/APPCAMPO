@@ -25,7 +25,7 @@ import { RegistrarGestionesDto } from './registro-gestion.dto';
 
 // Ruta base donde se guardan las imágenes
 // Cambiar según el servidor de producción
-const UPLOAD_BASE = process.env.UPLOAD_PATH ?? './uploads/gestiones';
+const UPLOAD_BASE = process.env.UPLOAD_PATH ?? './uploads';
 
 @Injectable()
 export class RegistroGestionService {
@@ -187,7 +187,7 @@ async registrarGestiones(
     const timestamp = ahora.getTime();
 
     const dirRelativo = path.join(String(año), mes, dia);
-    const dirAbsoluto = path.join(UPLOAD_BASE, dirRelativo);
+    const dirAbsoluto = path.join(UPLOAD_BASE, 'gestiones', dirRelativo);
     const nombreArchivo = `${timestamp}.${extension}`;
     const rutaAbsoluta  = path.join(dirAbsoluto, nombreArchivo);
     const rutaRelativa  = path.join('gestiones', dirRelativo, nombreArchivo)
