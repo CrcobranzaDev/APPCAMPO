@@ -1,0 +1,36 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, appcampo]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/crcobranzadev/appcampo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build y push
+        run: |
+          docker build -t $IMAGE:${{ github.sha }} .
+          docker push $IMAGE:${{ github.sha }}
+
+      - name: Deploy (rolling, start-first, rollback automatico)
+        run: |
+          TAG=${{ github.sha }} \
+          ENV_FILE=/opt/appcampo/.env \
+          UPLOADS_DIR=/root/Projects/appcampo/uploads \
+          docker stack deploy --with-registry-auth --detach=false -c docker-compose.yml appcampo
+
+      - name: Limpiar imagenes viejas
+        if: always()
+        run: docker image prune -af --filter "until=72h" || true

@@ -1,0 +1,36 @@
+# Stack de Swarm (single-node). Uso: TAG=<sha> ENV_FILE=<ruta> UPLOADS_DIR=<ruta> docker stack deploy -c docker-compose.yml appcampo
+services:
+  app:
+    image: ghcr.io/crcobranzadev/appcampo:${TAG:?TAG requerido}
+    env_file: ${ENV_FILE:?ENV_FILE requerido}
+    environment:
+      NODE_ENV: production
+      UPLOAD_PATH: /app/uploads
+    volumes:
+      - ${UPLOADS_DIR:?UPLOADS_DIR requerido}:/app/uploads
+    ports:
+      - target: 5005
+        published: 5005
+        protocol: tcp
+        mode: ingress
+    healthcheck:
+      # el puerto solo abre cuando Nest termino de iniciar (BDs conectadas)
+      test: ["CMD", "node", "-e", "require('net').connect(5005,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 30s
+    deploy:
+      replicas: 1
+      update_config:
+        order: start-first
+        parallelism: 1
+        monitor: 30s
+        failure_action: rollback
+      rollback_config:
+        order: start-first
+        parallelism: 1
+        monitor: 30s
+      restart_policy:
+        condition: on-failure

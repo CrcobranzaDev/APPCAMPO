@@ -21,8 +21,6 @@ import { ListasModule } from './listas/listas.module';
 import { DashboardGestoresModule } from './dasboard/dashboard-gestores.module';
 import { AsteriskinModule } from './asteriskin/asteriskin.module';
 import { IaCampoModule } from './ia/ia-campo.module';
-import { PostulacionesPublicasModule } from './postulaciones-publicas/postulaciones-publicas.module';
-import { ReclutamientoInternoModule } from './reclutamiento-interno/reclutamiento-interno.module';
 import { ListaNegraModule } from './listblack/listblack.module';
 
 
@@ -53,8 +51,6 @@ import { ListaNegraModule } from './listblack/listblack.module';
     DashboardGestoresModule,
     AsteriskinModule,
     IaCampoModule,
-    PostulacionesPublicasModule,
-    ReclutamientoInternoModule,
     ListaNegraModule
 
   ],
